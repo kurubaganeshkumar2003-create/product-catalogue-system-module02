@@ -1,0 +1,6 @@
+external_id,title,category,brand,price,stock_status
+SKU-1019,Anker Soundcore Space Q45 Headphones,Wireless Headphones,Anker,149.00,IN_STOCK
+SKU-1020,Skechers Go Walk Max Slip-On Shoes,Men's Footwear,Skechers,65.00,IN_STOCK
+SKU-1021,Invalid Negative Price USB-C Hub,Peripherals,Belkin,-25.00,IN_STOCK
+SKU-1022,Invalid Zero Price HDMI Cable,Peripherals,AmazonBasics,0.00,IN_STOCK
+SKU-1001,Duplicate Sony Headphones Entry,Wireless Headphones,Sony,299.00,IN_STOCK

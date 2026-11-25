@@ -1,0 +1,19 @@
+external_id,title,category,brand,price,stock_status
+SKU-1001,Sony WH-1000XM5 Wireless Headphones,Wireless Headphones,Sony,299.00,IN_STOCK
+SKU-1002,Apple AirPods Pro 2nd Gen,Wireless Headphones,Apple,249.00,IN_STOCK
+SKU-1003,Bose QuietComfort Ultra Earbuds,Wireless Headphones,Bose,279.00,LOW_STOCK
+SKU-1004,JBL Flip 6 Portable Bluetooth Speaker,Audio Speakers,JBL,119.00,IN_STOCK
+SKU-1005,Marshall Emberton II Portable Speaker,Audio Speakers,Marshall,169.00,IN_STOCK
+SKU-1006,Logitech MX Master 3S Wireless Mouse,Peripherals,Logitech,99.00,IN_STOCK
+SKU-1007,Keychron K2 Mechanical Keyboard,Peripherals,Keychron,89.00,LOW_STOCK
+SKU-1008,Razer DeathAdder V3 Pro Gaming Mouse,Peripherals,Razer,149.99,IN_STOCK
+SKU-1009,Dell UltraSharp 27-Inch 4K Monitor,Monitors,Dell,449.00,IN_STOCK
+SKU-1010,LG 24-Inch Full HD IPS Monitor,Monitors,LG,149.00,OUT_OF_STOCK
+SKU-1011,ASUS ROG Swift 27-Inch Gaming Monitor,Monitors,ASUS,549.00,LOW_STOCK
+SKU-1012,Samsung Galaxy Watch 6 Classic,Smartwatches,Samsung,329.00,IN_STOCK
+SKU-1013,Garmin Forerunner 265 GPS Watch,Smartwatches,Garmin,449.99,IN_STOCK
+SKU-1014,Nike Air Zoom Pegasus 40 Running Shoes,Men's Footwear,Nike,130.00,IN_STOCK
+SKU-1015,Adidas Ultraboost Light Sneakers,Men's Footwear,Adidas,160.00,LOW_STOCK
+SKU-1016,Puma Velocity Nitro 2 Running Shoes,Men's Footwear,Puma,120.00,IN_STOCK
+SKU-1017,Levi's 511 Slim Fit Cotton Jeans,Men's Apparel,Levi's,69.50,IN_STOCK
+SKU-1018,Tommy Hilfiger Classic Cotton Polo,Men's Apparel,Tommy Hilfiger,59.50,OUT_OF_STOCK
