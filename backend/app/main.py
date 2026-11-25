@@ -5,9 +5,11 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import psycopg
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from psycopg.rows import dict_row
 
 from app.csv_mapper import detect_column_mapping, parse_row_with_mapping
 from app.database import get_db, init_db
@@ -17,6 +19,7 @@ load_dotenv()
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "dev-catalog-admin-token")
 MAX_CSV_IMPORT_ROWS = int(os.getenv("MAX_CSV_IMPORT_ROWS", "1000"))
+CLOUD_DATABASE_URL = os.getenv("CLOUD_DATABASE_URL", "").strip()
 
 app = FastAPI(
     title="Product Catalogue & Taxonomy API",
@@ -35,6 +38,74 @@ app.add_middleware(
 
 def compute_eligibility(status: str, stock_status: str) -> bool:
     return status == "ACTIVE" and stock_status in {"IN_STOCK", "LOW_STOCK"}
+
+
+def mirror_local_to_cloud():
+    """Mirrors local PostgreSQL state to Supabase whenever CLOUD_DATABASE_URL is configured."""
+    if not CLOUD_DATABASE_URL:
+        return
+    try:
+        with get_db() as l_conn:
+            with l_conn.cursor() as l_cur:
+                l_cur.execute("SELECT * FROM categories ORDER BY created_at ASC")
+                cats = l_cur.fetchall()
+                l_cur.execute("SELECT * FROM products ORDER BY created_at ASC")
+                prods = l_cur.fetchall()
+                l_cur.execute("SELECT * FROM product_attributes")
+                attrs = l_cur.fetchall()
+                l_cur.execute("SELECT * FROM catalog_import_jobs ORDER BY created_at ASC")
+                jobs = l_cur.fetchall()
+
+        with psycopg.connect(CLOUD_DATABASE_URL, row_factory=dict_row) as c_conn:
+            with c_conn.cursor() as c_cur:
+                c_cur.execute("DELETE FROM product_attributes;")
+                c_cur.execute("DELETE FROM product_categories;")
+                c_cur.execute("DELETE FROM products;")
+                c_cur.execute("DELETE FROM categories;")
+                c_cur.execute("DELETE FROM catalog_import_jobs;")
+
+                if cats:
+                    c_cur.executemany(
+                        "INSERT INTO categories (id, parent_id, name, slug, is_active, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                        [(c["id"], c["parent_id"], c["name"], c["slug"], c["is_active"], c["created_at"]) for c in cats],
+                    )
+                if prods:
+                    c_cur.executemany(
+                        """
+                        INSERT INTO products (id, external_id, title, description, category_id, brand, price, currency, stock_status, status, image_url, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        [
+                            (
+                                p["id"], p["external_id"], p["title"], p["description"], p["category_id"],
+                                p["brand"], p["price"], p["currency"], p["stock_status"], p["status"],
+                                p["image_url"], p["created_at"], p["updated_at"],
+                            )
+                            for p in prods
+                        ],
+                    )
+                if attrs:
+                    c_cur.executemany(
+                        "INSERT INTO product_attributes (id, product_id, attribute_key, attribute_value) VALUES (%s, %s, %s, %s)",
+                        [(a["id"], a["product_id"], a["attribute_key"], a["attribute_value"]) for a in attrs],
+                    )
+                if jobs:
+                    c_cur.executemany(
+                        """
+                        INSERT INTO catalog_import_jobs (id, filename, status, total_rows, valid_rows, error_rows, errors_json, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                        """,
+                        [
+                            (
+                                j["id"], j["filename"], j["status"], j["total_rows"],
+                                j["valid_rows"], j["error_rows"], json.dumps(j["errors_json"]), j["created_at"],
+                            )
+                            for j in jobs
+                        ],
+                    )
+            c_conn.commit()
+    except Exception as exc:
+        print(f"[Dual-Sync Warning] Could not mirror to Supabase: {exc}")
 
 
 def get_or_create_category(cur, category_name: str) -> str:
@@ -90,10 +161,6 @@ def on_startup():
     init_db()
 
 
-# ============================================================================
-# HEALTH & METADATA
-# ============================================================================
-
 @app.get("/")
 @app.get("/api/v1/health")
 def health_check():
@@ -101,13 +168,10 @@ def health_check():
         "status": "healthy",
         "service": "Product Catalogue & Taxonomy API",
         "version": "2.0.0",
+        "dual_sync": bool(CLOUD_DATABASE_URL),
         "docs": "/docs",
     }
 
-
-# ============================================================================
-# PRODUCTS & AI ELIGIBILITY
-# ============================================================================
 
 @app.get("/api/v1/products")
 def list_products(
@@ -183,7 +247,11 @@ def get_product(product_id: str):
 
 
 @app.post("/api/v1/admin/products", status_code=201)
-def create_product(payload: ProductCreate, x_admin_token: Optional[str] = Header(default=None)):
+def create_product(
+    payload: ProductCreate,
+    background_tasks: BackgroundTasks,
+    x_admin_token: Optional[str] = Header(default=None),
+):
     verify_admin(x_admin_token)
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -228,11 +296,17 @@ def create_product(payload: ProductCreate, x_admin_token: Optional[str] = Header
 
             result = serialize_product(cur, created)
         conn.commit()
+    background_tasks.add_task(mirror_local_to_cloud)
     return result
 
 
 @app.patch("/api/v1/admin/products/{product_id}")
-def update_product(product_id: str, payload: ProductUpdate, x_admin_token: Optional[str] = Header(default=None)):
+def update_product(
+    product_id: str,
+    payload: ProductUpdate,
+    background_tasks: BackgroundTasks,
+    x_admin_token: Optional[str] = Header(default=None),
+):
     verify_admin(x_admin_token)
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -295,11 +369,16 @@ def update_product(product_id: str, payload: ProductUpdate, x_admin_token: Optio
 
             result = serialize_product(cur, row)
         conn.commit()
+    background_tasks.add_task(mirror_local_to_cloud)
     return result
 
 
 @app.delete("/api/v1/admin/products/{product_id}")
-def delete_product(product_id: str, x_admin_token: Optional[str] = Header(default=None)):
+def delete_product(
+    product_id: str,
+    background_tasks: BackgroundTasks,
+    x_admin_token: Optional[str] = Header(default=None),
+):
     verify_admin(x_admin_token)
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -311,15 +390,13 @@ def delete_product(product_id: str, x_admin_token: Optional[str] = Header(defaul
             if not deleted:
                 raise HTTPException(status_code=404, detail="Product not found")
         conn.commit()
+    background_tasks.add_task(mirror_local_to_cloud)
     return {"deleted": True, "external_id": deleted["external_id"]}
 
 
-# ============================================================================
-# FAST BATCH CSV BULK INGESTION (TEMPLATE & RAW KAGGLE CSVs)
-# ============================================================================
-
 @app.post("/api/v1/admin/catalog/import")
 async def import_catalog_csv(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     max_rows: int = Query(default=MAX_CSV_IMPORT_ROWS, ge=1, le=5000),
     x_admin_token: Optional[str] = Header(default=None),
@@ -343,7 +420,6 @@ async def import_catalog_csv(
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            # 1. Pre-load existing SKUs and categories in 2 single queries
             cur.execute("SELECT LOWER(external_id) AS sku FROM products")
             existing_skus = {r["sku"] for r in cur.fetchall()}
 
@@ -353,7 +429,6 @@ async def import_catalog_csv(
                 cat_cache[r["slug"]] = str(r["id"])
                 cat_cache[r["lname"]] = str(r["id"])
 
-            # 2. Validate and normalize all rows in memory
             for idx, row in enumerate(all_rows[:max_rows], start=2):
                 total_rows += 1
                 parsed, err_msg = parse_row_with_mapping(row, idx, mapping, is_strict_template)
@@ -375,7 +450,6 @@ async def import_catalog_csv(
                 existing_skus.add(sku_low)
                 valid_items.append(parsed)
 
-            # 3. Insert any newly discovered categories once
             for item in valid_items:
                 cat_name = item["category"]
                 slug = cat_name.strip().lower().replace(" ", "-").replace("'", "")
@@ -389,7 +463,6 @@ async def import_catalog_csv(
                     cat_cache[cat_name.lower()] = new_id
                 item["category_id"] = cat_cache.get(slug) or cat_cache[cat_name.lower()]
 
-            # 4. Batch insert products and dynamic attributes
             if valid_items:
                 product_params = [
                     (
@@ -446,6 +519,7 @@ async def import_catalog_csv(
             job_id = str(cur.fetchone()["id"])
         conn.commit()
 
+    background_tasks.add_task(mirror_local_to_cloud)
     return {
         "job_id": job_id,
         "filename": file.filename,
@@ -501,10 +575,6 @@ def get_import_job(job_id: str):
             }
 
 
-# ============================================================================
-# CATEGORIES & TAXONOMY
-# ============================================================================
-
 @app.get("/api/v1/categories")
 def list_categories():
     with get_db() as conn:
@@ -533,7 +603,11 @@ def list_categories():
 
 
 @app.post("/api/v1/categories", status_code=201)
-def create_category(payload: CategoryCreate, x_admin_token: Optional[str] = Header(default=None)):
+def create_category(
+    payload: CategoryCreate,
+    background_tasks: BackgroundTasks,
+    x_admin_token: Optional[str] = Header(default=None),
+):
     verify_admin(x_admin_token)
     slug = payload.slug.strip().lower().replace(" ", "-")
     with get_db() as conn:
@@ -547,6 +621,7 @@ def create_category(payload: CategoryCreate, x_admin_token: Optional[str] = Head
             )
             cat_id = str(cur.fetchone()["id"])
         conn.commit()
+    background_tasks.add_task(mirror_local_to_cloud)
     return {
         "id": cat_id,
         "parent_id": payload.parent_id or None,
@@ -558,7 +633,10 @@ def create_category(payload: CategoryCreate, x_admin_token: Optional[str] = Head
 
 
 @app.delete("/api/v1/admin/reset")
-def reset_all_data(x_admin_token: Optional[str] = Header(default=None)):
+def reset_all_data(
+    background_tasks: BackgroundTasks,
+    x_admin_token: Optional[str] = Header(default=None),
+):
     verify_admin(x_admin_token)
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -568,4 +646,83 @@ def reset_all_data(x_admin_token: Optional[str] = Header(default=None)):
             cur.execute("DELETE FROM categories;")
             cur.execute("DELETE FROM catalog_import_jobs;")
         conn.commit()
+    background_tasks.add_task(mirror_local_to_cloud)
     return {"message": "All PostgreSQL catalog tables cleared"}
+
+
+@app.post("/api/v1/admin/sync-cloud-to-local")
+def sync_cloud_to_local(x_admin_token: Optional[str] = Header(default=None)):
+    verify_admin(x_admin_token)
+    if not CLOUD_DATABASE_URL:
+        raise HTTPException(
+            status_code=400,
+            detail="CLOUD_DATABASE_URL is not configured in local backend/.env",
+        )
+
+    with psycopg.connect(CLOUD_DATABASE_URL, row_factory=dict_row) as cloud_conn:
+        with cloud_conn.cursor() as c_cur:
+            c_cur.execute("SELECT * FROM categories ORDER BY created_at ASC")
+            cloud_cats = c_cur.fetchall()
+            c_cur.execute("SELECT * FROM products ORDER BY created_at ASC")
+            cloud_prods = c_cur.fetchall()
+            c_cur.execute("SELECT * FROM product_attributes")
+            cloud_attrs = c_cur.fetchall()
+            c_cur.execute("SELECT * FROM catalog_import_jobs ORDER BY created_at ASC")
+            cloud_jobs = c_cur.fetchall()
+
+    with get_db() as local_conn:
+        with local_conn.cursor() as l_cur:
+            l_cur.execute("DELETE FROM product_attributes;")
+            l_cur.execute("DELETE FROM product_categories;")
+            l_cur.execute("DELETE FROM products;")
+            l_cur.execute("DELETE FROM categories;")
+            l_cur.execute("DELETE FROM catalog_import_jobs;")
+
+            if cloud_cats:
+                l_cur.executemany(
+                    "INSERT INTO categories (id, parent_id, name, slug, is_active, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                    [(c["id"], c["parent_id"], c["name"], c["slug"], c["is_active"], c["created_at"]) for c in cloud_cats],
+                )
+            if cloud_prods:
+                l_cur.executemany(
+                    """
+                    INSERT INTO products (id, external_id, title, description, category_id, brand, price, currency, stock_status, status, image_url, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    [
+                        (
+                            p["id"], p["external_id"], p["title"], p["description"], p["category_id"],
+                            p["brand"], p["price"], p["currency"], p["stock_status"], p["status"],
+                            p["image_url"], p["created_at"], p["updated_at"],
+                        )
+                        for p in cloud_prods
+                    ],
+                )
+            if cloud_attrs:
+                l_cur.executemany(
+                    "INSERT INTO product_attributes (id, product_id, attribute_key, attribute_value) VALUES (%s, %s, %s, %s)",
+                    [(a["id"], a["product_id"], a["attribute_key"], a["attribute_value"]) for a in cloud_attrs],
+                )
+            if cloud_jobs:
+                l_cur.executemany(
+                    """
+                    INSERT INTO catalog_import_jobs (id, filename, status, total_rows, valid_rows, error_rows, errors_json, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    """,
+                    [
+                        (
+                            j["id"], j["filename"], j["status"], j["total_rows"],
+                            j["valid_rows"], j["error_rows"], json.dumps(j["errors_json"]), j["created_at"],
+                        )
+                        for j in cloud_jobs
+                    ],
+                )
+        local_conn.commit()
+
+    return {
+        "synced": True,
+        "categories": len(cloud_cats),
+        "products": len(cloud_prods),
+        "attributes": len(cloud_attrs),
+        "import_jobs": len(cloud_jobs),
+    }
